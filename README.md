@@ -1,14 +1,13 @@
 ---
 title: Video Object Remover
 emoji: 🎬
-colorFrom: emerald
-colorTo: cyan
+colorFrom: green
+colorTo: blue
 sdk: gradio
 sdk_version: 5.12.0
 app_file: app.py
 pinned: false
 license: mit
-hardware: t4-small
 ---
 
 # 🎬 Video Object Remover
