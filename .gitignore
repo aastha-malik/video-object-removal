@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+sam2/
+ProPainter/
+*.pt
+.env

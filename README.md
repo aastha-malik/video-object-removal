@@ -1,7 +1,28 @@
-# Video Object Removal
-AI-powered video object removal using SAM2 + ProPainter
+---
+title: Video Object Remover
+emoji: 🎬
+colorFrom: emerald
+colorTo: cyan
+sdk: gradio
+sdk_version: 5.12.0
+app_file: app.py
+pinned: false
+license: mit
+hardware: t4-small
+---
 
-## Progress
-- SAM2 installed and working
-- Bunny segmented with 0.981 confidence
-- ProPainter installed
+# 🎬 Video Object Remover
+
+Remove any object from a video using **SAM2** (Segment Anything Model 2) + **ProPainter** (video inpainting).
+
+## How it works
+1. Upload a video
+2. Click on the first frame to select objects you want removed
+3. SAM2 tracks those objects across all frames
+4. ProPainter fills in the gaps seamlessly
+5. Download your clean video!
+
+## Tech Stack
+- **SAM2** — Meta's Segment Anything Model 2 for object tracking
+- **ProPainter** — State-of-the-art video inpainting
+- **Gradio** — Web UI
