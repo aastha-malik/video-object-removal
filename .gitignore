@@ -4,3 +4,13 @@ sam2/
 ProPainter/
 *.pt
 .env
+
+# Python virtualenv
+be/venv/
+venv/
+__pycache__/
+*.pyc
+
+# Node
+fe/node_modules/
+fe/.next/
