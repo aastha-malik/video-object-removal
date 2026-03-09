@@ -1,5 +1,4 @@
 """FastAPI backend for Video Object Remover."""
-import asyncio
 import base64
 import json
 import logging
@@ -72,7 +71,7 @@ async def upload_video(file: UploadFile = File(...)):
 
 
 async def upload_file_to_hf(client: httpx.AsyncClient, video_path: str) -> str:
-    """Upload a local video file to the HF Space and return the remote file path."""
+    """Upload local video to HF Space, return remote path."""
     filename = Path(video_path).name
     with open(video_path, "rb") as f:
         resp = await client.post(
@@ -81,51 +80,74 @@ async def upload_file_to_hf(client: httpx.AsyncClient, video_path: str) -> str:
             timeout=120,
         )
     resp.raise_for_status()
-    paths = resp.json()
-    return paths[0]  # e.g. "tmp/gradio/abc123/video.mp4"
+    return resp.json()[0]  # e.g. "tmp/gradio/abc123/video.mp4"
 
 
-async def stream_hf_progress(client: httpx.AsyncClient, remote_path: str, coords_json: str, session_hash: str):
+async def call_on_remove(client: httpx.AsyncClient, remote_path: str, coords_json: str):
     """
-    Join the Gradio queue and yield SSE event dicts.
-    fn_index=3 corresponds to remove_btn.click(on_remove, ...) in app.py.
-    Gradio 5 requires fn_index; api_name is not supported in queue/join.
+    Call /gradio_api/call/on_remove (Gradio 5 named API).
+    Returns an event_id to poll for results.
+    Input: FileData (plain, no VideoData wrapper) + coords_json string.
     """
-    # Gradio 5 gr.Video expects VideoData: {"video": FileData, "subtitles": null}
-    join_payload = {
+    payload = {
         "data": [
             {
-                "video": {
-                    "path": remote_path,
-                    "meta": {"_type": "gradio.FileData"},
-                },
-                "subtitles": None,
+                "path": remote_path,
+                "meta": {"_type": "gradio.FileData"},
             },
             coords_json,
-        ],
-        "fn_index": 3,
-        "session_hash": session_hash,
+        ]
     }
-    resp = await client.post(f"{HF_API_URL}/queue/join", json=join_payload, timeout=30)
+    log.info("Calling /on_remove with path=%s coords=%s", remote_path, coords_json[:200])
+    resp = await client.post(
+        f"{HF_API_URL}/call/on_remove",
+        json=payload,
+        timeout=30,
+    )
     resp.raise_for_status()
+    event_id = resp.json()["event_id"]
+    log.info("Got event_id: %s", event_id)
+    return event_id
 
+
+async def stream_on_remove_result(client: httpx.AsyncClient, event_id: str, websocket: WebSocket, _hb: int = 0):
+    """
+    Stream SSE results from /gradio_api/call/on_remove/{event_id}.
+    Gradio 5 named API sends:
+      event: heartbeat   data: null   (keep-alive, ~every 15s while processing)
+      event: complete    data: [video_output, status_text]
+      event: error       data: "error message"
+    """
+    event_type = None
+    heartbeat_count = 0
+    steps = ["Extracting frames...", "SAM2: Loading model...", "SAM2: Tracking objects...",
+             "ProPainter: Inpainting...", "Finalizing video..."]
     async with client.stream(
         "GET",
-        f"{HF_API_URL}/queue/data",
-        params={"session_hash": session_hash},
-        timeout=600,
+        f"{HF_API_URL}/call/on_remove/{event_id}",
+        timeout=1800,
     ) as stream:
         async for line in stream.aiter_lines():
-            if not line.startswith("data:"):
-                continue
-            payload = line[5:].strip()
-            if not payload:
-                continue
-            event = json.loads(payload)
-            log.info("SSE event [%s]: %s", event.get("msg"), json.dumps(event)[:300])
-            yield event
-            if event.get("msg") in ("process_completed", "error"):
-                return
+            if line.startswith("event:"):
+                event_type = line[6:].strip()
+                log.info("SSE event: %s", event_type)
+            elif line.startswith("data:"):
+                payload = line[5:].strip()
+                if not payload:
+                    continue
+                parsed = json.loads(payload)
+                if event_type == "heartbeat":
+                    # Pipeline is running — show cycling progress messages
+                    heartbeat_count += 1
+                    step_msg = steps[min(heartbeat_count // 3, len(steps) - 1)]
+                    pct = min(20 + heartbeat_count * 2, 90)
+                    await websocket.send_json({"progress": pct, "message": step_msg})
+                elif event_type == "complete":
+                    log.info("SSE complete data: %s", str(parsed)[:300])
+                    yield parsed
+                    return
+                elif event_type == "error":
+                    raise Exception(f"HF Space error: {parsed}")
 
 
 @app.websocket("/ws/process")
@@ -135,118 +157,92 @@ async def process_video(websocket: WebSocket):
         data = await websocket.receive_json()
         session_id = data.get("session_id")
         coordinates = data.get("coordinates", [])
+        log.info("WS received session=%s coords_count=%d", session_id, len(coordinates))
 
         session = sessions.get(session_id)
         if not session:
             await websocket.send_json({"error": "Session not found"})
             return
 
+        if not coordinates:
+            await websocket.send_json({"error": "No coordinates provided"})
+            return
+
         video_path = session["video_path"]
         coords_json = json.dumps(coordinates)
-        session_hash = str(uuid.uuid4())[:12]
 
         await websocket.send_json({"progress": 5, "message": "Uploading video to ML pipeline..."})
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(60, read=1800)) as client:
+            # Step 0: Wake the HF Space (free tier hibernates after inactivity)
+            await websocket.send_json({"progress": 3, "message": "Waking up ML pipeline (may take ~15s)..."})
+            try:
+                await client.get(HF_SPACE_URL, timeout=30)
+            except Exception:
+                pass  # ignore wake-up errors, proceed anyway
+
             # Step 1: Upload video to HF Space
             remote_path = await upload_file_to_hf(client, video_path)
+            log.info("Uploaded to HF: %s", remote_path)
             await websocket.send_json({"progress": 12, "message": "Video uploaded, starting ML processing..."})
 
-            # Step 2: Stream SSE events from the Gradio queue
-            async for event in stream_hf_progress(client, remote_path, coords_json, session_hash):
-                msg = event.get("msg")
+            # Step 2: Call the named API endpoint
+            event_id = await call_on_remove(client, remote_path, coords_json)
+            await websocket.send_json({"progress": 20, "message": "ML processing started (SAM2 + ProPainter)..."})
 
-                if msg == "estimation":
-                    rank = event.get("rank", 0)
-                    if rank and rank > 0:
-                        await websocket.send_json({
-                            "progress": 15,
-                            "message": f"Waiting in queue (position {rank})...",
-                        })
+            # Step 3: Stream the result (heartbeats keep connection alive while SAM2+ProPainter runs)
+            heartbeat_count = 0
+            async for result_data in stream_on_remove_result(client, event_id, websocket, heartbeat_count):
+                log.info("Result data: %s", json.dumps(result_data)[:500])
 
-                elif msg == "process_starts":
-                    await websocket.send_json({"progress": 20, "message": "Processing started..."})
-
-                elif msg == "progress":
-                    for p in event.get("progress_data", []):
-                        idx = p.get("index", 0)
-                        length = p.get("length") or 1
-                        raw = p.get("progress")
-                        pct = int(float(raw) * 100) if raw is not None else int(idx / length * 100)
-                        # Map ML progress (0-100) to 20-95 range
-                        display_pct = 20 + int(pct * 0.75)
-                        desc = p.get("desc") or "Processing..."
-                        await websocket.send_json({"progress": display_pct, "message": desc})
-
-                elif msg == "process_generating":
-                    # Intermediate output – ignore
-                    pass
-
-                elif msg == "process_completed":
-                    log.info("process_completed event: %s", json.dumps(event)[:1000])
-                    output = event.get("output", {})
-
-                    # Gradio surfaces errors two ways:
-                    # 1. output["error"] field (top-level failure)
-                    # 2. output["data"][0] is None with message in output["data"][1]
-                    if output.get("error"):
-                        await websocket.send_json({"error": output["error"]})
-                        return
-
-                    output_data = output.get("data", [])
-                    if not output_data or output_data[0] is None:
-                        # Extract the status message — it usually contains the error text
-                        status_msg = output_data[1] if len(output_data) > 1 else None
-                        err_text = str(status_msg) if status_msg else "ML pipeline returned no output"
-                        await websocket.send_json({"error": err_text})
-                        return
-
-                    # output_data[0] is VideoData: {"video": FileData, "subtitles": ...}
-                    result_video_data = output_data[0]
-                    status_msg = output_data[1] if len(output_data) > 1 else "Done!"
-
-                    # Unwrap VideoData → FileData
-                    if isinstance(result_video_data, dict) and "video" in result_video_data:
-                        result_file = result_video_data["video"]
-                    else:
-                        result_file = result_video_data
-
-                    # Resolve the result video URL from FileData
-                    if isinstance(result_file, dict):
-                        file_url = result_file.get("url") or result_file.get("path", "")
-                    else:
-                        file_url = str(result_file)
-
-                    # If it's a relative path, build the full URL
-                    if file_url and not file_url.startswith("http"):
-                        file_url = f"{HF_API_URL}/file={file_url}"
-
-                    # Download the result video locally
-                    await websocket.send_json({"progress": 97, "message": "Downloading result..."})
-                    result_path = RESULT_DIR / f"{session_id}_result.mp4"
-                    async with client.stream("GET", file_url, timeout=120) as dl:
-                        dl.raise_for_status()
-                        with open(result_path, "wb") as out:
-                            async for chunk in dl.aiter_bytes(8192):
-                                out.write(chunk)
-
-                    sessions[session_id]["result_path"] = str(result_path)
-                    await websocket.send_json({
-                        "done": True,
-                        "progress": 100,
-                        "message": str(status_msg),
-                        "result_url": f"/api/result/{session_id}",
-                    })
+                # result_data is a list: [video_output, status_text]
+                if not isinstance(result_data, list) or len(result_data) < 2:
+                    await websocket.send_json({"error": f"Unexpected result format: {result_data}"})
                     return
 
-                elif msg == "error":
-                    err = event.get("output") or "Unknown error from ML pipeline"
-                    await websocket.send_json({"error": str(err)})
+                result_file_data = result_data[0]  # FileData dict or None
+                status_msg = result_data[1] or ""
+
+                if result_file_data is None:
+                    err = str(status_msg) if status_msg else "ML pipeline returned no output"
+                    await websocket.send_json({"error": err})
                     return
+
+                # Resolve download URL from FileData
+                if isinstance(result_file_data, dict):
+                    file_url = result_file_data.get("url") or result_file_data.get("path", "")
+                else:
+                    file_url = str(result_file_data)
+
+                if file_url and not file_url.startswith("http"):
+                    file_url = f"{HF_API_URL}/file={file_url}"
+
+                log.info("Downloading result from: %s", file_url)
+                await websocket.send_json({"progress": 95, "message": "Downloading result video..."})
+
+                result_path = RESULT_DIR / f"{session_id}_result.mp4"
+                async with client.stream("GET", file_url, timeout=300) as dl:
+                    dl.raise_for_status()
+                    with open(result_path, "wb") as out:
+                        async for chunk in dl.aiter_bytes(8192):
+                            out.write(chunk)
+
+                sessions[session_id]["result_path"] = str(result_path)
+                await websocket.send_json({
+                    "done": True,
+                    "progress": 100,
+                    "message": str(status_msg),
+                    "result_url": f"/api/result/{session_id}",
+                })
+                return
+
+            await websocket.send_json({"error": "No result received from ML pipeline"})
 
     except httpx.HTTPStatusError as e:
-        await websocket.send_json({"error": f"HF Space API error: {e.response.status_code}"})
+        log.error("HTTP error: %s %s", e.response.status_code, e.response.text[:200])
+        await websocket.send_json({"error": f"HF Space API error: {e.response.status_code} — {e.response.text[:200]}"})
     except Exception as e:
+        log.exception("Unexpected error")
         await websocket.send_json({"error": str(e)})
     finally:
         await websocket.close()

@@ -201,11 +201,7 @@ custom_css = """
 """
 
 # ─── BUILD UI ───
-with gr.Blocks(
-    title="Video Object Remover",
-    theme=gr.themes.Base(primary_hue="emerald"),
-    css=custom_css
-) as demo:
+with gr.Blocks(title="Video Object Remover") as demo:
 
     gr.HTML("""
         <div id="header">
@@ -290,7 +286,12 @@ with gr.Blocks(
         return remove_objects(video, coords_json)
 
     # ─── Wire Events ───
+    # Use both .change() and .upload() to catch all video input methods
     video_input.change(
+        on_video_upload, [video_input],
+        [frame_preview, original_frame, coords_display, coord_state]
+    )
+    video_input.upload(
         on_video_upload, [video_input],
         [frame_preview, original_frame, coords_display, coord_state]
     )
@@ -310,4 +311,10 @@ with gr.Blocks(
 
 # ─── Launch ───
 if __name__ == "__main__":
-    demo.launch(allowed_paths=["/tmp"])
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        allowed_paths=["/tmp"],
+        theme=gr.themes.Base(primary_hue="emerald"),
+        css=custom_css,
+    )
