@@ -121,12 +121,6 @@ Then update the backend config to point to your local ML endpoint.
 
 ---
 
-## 📄 License
-
-This project is open source. See [LICENSE](LICENSE) for details.
-
----
-
 ## 🙏 Acknowledgements
 
 - [Meta AI — Segment Anything](https://github.com/facebookresearch/segment-anything)
