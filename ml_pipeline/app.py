@@ -357,5 +357,4 @@ if __name__ == "__main__":
         theme=gr.themes.Base(primary_hue="emerald"),
         css=custom_css,
         ssr_mode=False,
-        show_api=False,
     )
