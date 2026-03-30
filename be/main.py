@@ -1,4 +1,5 @@
 """FastAPI backend for Video Object Remover."""
+import asyncio
 import base64
 import json
 import logging
@@ -117,37 +118,57 @@ async def stream_on_remove_result(client: httpx.AsyncClient, event_id: str, webs
       event: heartbeat   data: null   (keep-alive, ~every 15s while processing)
       event: complete    data: [video_output, status_text]
       event: error       data: "error message"
+
+    HF free-tier proxies drop long-running SSE connections. We reconnect to the
+    same event_id (Gradio 5 SSE streams are reconnectable) up to MAX_RETRIES times.
     """
+    MAX_RETRIES = 5
     event_type = None
     heartbeat_count = 0
     steps = ["Extracting frames...", "SAM2: Loading model...", "SAM2: Tracking objects...",
              "ProPainter: Inpainting...", "Finalizing video..."]
-    async with client.stream(
-        "GET",
-        f"{HF_API_URL}/call/on_remove/{event_id}",
-        timeout=1800,
-    ) as stream:
-        async for line in stream.aiter_lines():
-            if line.startswith("event:"):
-                event_type = line[6:].strip()
-                log.info("SSE event: %s", event_type)
-            elif line.startswith("data:"):
-                payload = line[5:].strip()
-                if not payload:
-                    continue
-                parsed = json.loads(payload)
-                if event_type == "heartbeat":
-                    # Pipeline is running — show cycling progress messages
-                    heartbeat_count += 1
-                    step_msg = steps[min(heartbeat_count // 3, len(steps) - 1)]
-                    pct = min(20 + heartbeat_count * 2, 90)
-                    await websocket.send_json({"progress": pct, "message": step_msg})
-                elif event_type == "complete":
-                    log.info("SSE complete data: %s", str(parsed)[:300])
-                    yield parsed
-                    return
-                elif event_type == "error":
-                    raise Exception(f"HF Space error: {parsed}")
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with client.stream(
+                "GET",
+                f"{HF_API_URL}/call/on_remove/{event_id}",
+                timeout=1800,
+            ) as stream:
+                async for line in stream.aiter_lines():
+                    if line.startswith("event:"):
+                        event_type = line[6:].strip()
+                        log.info("SSE event: %s", event_type)
+                    elif line.startswith("data:"):
+                        payload = line[5:].strip()
+                        if not payload:
+                            continue
+                        parsed = json.loads(payload)
+                        if event_type == "heartbeat":
+                            heartbeat_count += 1
+                            step_msg = steps[min(heartbeat_count // 3, len(steps) - 1)]
+                            pct = min(20 + heartbeat_count * 2, 90)
+                            await websocket.send_json({"progress": pct, "message": step_msg})
+                        elif event_type == "complete":
+                            log.info("SSE complete data: %s", str(parsed)[:300])
+                            yield parsed
+                            return
+                        elif event_type == "error":
+                            raise Exception(f"HF Space error: {parsed}")
+            # Stream ended without complete/error — treat as dropped connection
+            raise httpx.RemoteProtocolError("SSE stream ended without result", request=None)
+        except httpx.RemoteProtocolError as e:
+            if attempt < MAX_RETRIES - 1:
+                wait = 3 * (attempt + 1)
+                log.warning("SSE connection dropped (attempt %d/%d), reconnecting in %ds: %s",
+                            attempt + 1, MAX_RETRIES, wait, e)
+                await websocket.send_json({
+                    "progress": min(20 + heartbeat_count * 2, 90),
+                    "message": f"Connection dropped, reconnecting... (attempt {attempt + 2}/{MAX_RETRIES})"
+                })
+                await asyncio.sleep(wait)
+            else:
+                raise
 
 
 @app.websocket("/ws/process")

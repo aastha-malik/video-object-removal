@@ -1,5 +1,5 @@
-gradio>=5.20.0
-gradio-client>=1.7.0
+gradio==5.23.3
+gradio-client==1.10.1
 torch
 torchvision
 opencv-python-headless

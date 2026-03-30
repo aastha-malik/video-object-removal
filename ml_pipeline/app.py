@@ -60,13 +60,38 @@ def remove_objects(video_path, coords_json, progress=gr.Progress()):
         for d in [frames_dir, masks_dir, output_dir]:
             os.makedirs(d, exist_ok=True)
 
-        # ─── STEP 1: Extract frames ───
+        # ─── STEP 1: Extract frames (capped at MAX_FRAMES) ───
+        MAX_FRAMES = 60  # CPU inference: ~14s/frame × 60 = ~14 min for SAM2
         progress(0.1, desc="Extracting frames...")
-        subprocess.run([
-            'ffmpeg', '-i', video_path, '-q:v', '2',
-            os.path.join(frames_dir, '%05d.jpg'),
-            '-hide_banner', '-loglevel', 'quiet'
-        ], check=True)
+
+        # Get total frame count first
+        probe = subprocess.run([
+            'ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
+            '-count_frames', '-show_entries', 'stream=nb_read_frames',
+            '-of', 'csv=p=0', video_path
+        ], capture_output=True, text=True)
+        try:
+            total_frames = int(probe.stdout.strip())
+        except Exception:
+            total_frames = 9999  # unknown, extract all then subsample
+
+        # Subsample: if video has more than MAX_FRAMES, skip every Nth frame
+        if total_frames > MAX_FRAMES:
+            # -vf "select=not(mod(n,STEP))" picks every STEP-th frame
+            step = max(1, total_frames // MAX_FRAMES)
+            print(f"📽️  {total_frames} total frames → subsampling every {step} frames (max {MAX_FRAMES})")
+            subprocess.run([
+                'ffmpeg', '-i', video_path, '-vf', f"select=not(mod(n\\,{step}))",
+                '-vsync', 'vfr', '-q:v', '2',
+                os.path.join(frames_dir, '%05d.jpg'),
+                '-hide_banner', '-loglevel', 'quiet'
+            ], check=True)
+        else:
+            subprocess.run([
+                'ffmpeg', '-i', video_path, '-q:v', '2',
+                os.path.join(frames_dir, '%05d.jpg'),
+                '-hide_banner', '-loglevel', 'quiet'
+            ], check=True)
 
         num_frames = len([f for f in os.listdir(frames_dir) if f.endswith('.jpg')])
         print(f"📁 Extracted {num_frames} frames")
@@ -137,11 +162,25 @@ def remove_objects(video_path, coords_json, progress=gr.Progress()):
         sample = cv2.imread(os.path.join(frames_dir, '00001.jpg'))
         h, w = sample.shape[:2]
 
-        subprocess.run([
+        # Downscale to 480p max to avoid CPU OOM (resize_ratio scales both dims)
+        max_side = 480
+        resize_ratio = min(1.0, max_side / max(h, w))
+        target_h = int(h * resize_ratio) & ~1   # must be even for libx264
+        target_w = int(w * resize_ratio) & ~1
+
+        print(f"🎨 ProPainter: {w}×{h} → {target_w}×{target_h} (resize_ratio={resize_ratio:.2f})")
+
+        result = subprocess.run([
             sys.executable, 'inference_propainter.py',
             '--video', frames_dir, '--mask', masks_dir,
-            '--output', output_dir, '--height', str(h), '--width', str(w)
-        ], check=True)
+            '--output', output_dir,
+            '--height', str(target_h), '--width', str(target_w),
+            '--fp16',  # half-precision: ~2x faster, ~half the RAM
+        ], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            print("ProPainter stderr:", result.stderr[-2000:])
+            raise RuntimeError(f"ProPainter failed (exit {result.returncode}): {result.stderr[-500:]}")
 
         progress(0.9, desc="Finalizing video...")
 
@@ -317,4 +356,6 @@ if __name__ == "__main__":
         allowed_paths=["/tmp"],
         theme=gr.themes.Base(primary_hue="emerald"),
         css=custom_css,
+        ssr_mode=False,
+        show_api=False,
     )
